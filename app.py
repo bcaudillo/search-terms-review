@@ -1,7 +1,7 @@
 import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
-st.write(list(st.secrets.keys()))
+
 engine = create_engine(st.secrets["URL"])
 query = """
 SELECT
