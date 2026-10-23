@@ -2,7 +2,7 @@ import pandas as pd
 import streamlit as st
 from sqlalchemy import create_engine
 
-engine = create_engine("URL")
+engine = create_engine(st.secret["URL"])
 query = """
 SELECT
     s.date,
