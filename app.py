@@ -1,29 +1,51 @@
 import re
 
 import altair as alt
+import numpy as np
 import pandas as pd
 import streamlit as st
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 
 st.set_page_config(page_title="Search Term Review", layout="wide")
 
-QUERY = """
-    SELECT s.date,
-           s.search_term,
-           s.info_text               AS keyword,
-           s.search_term_match_type  AS match_type,
-           c.name                    AS campaign,
-           g.name                    AS ad_group,
-           s.impressions,
-           s.clicks,
-           s.cost_micros / 1000000.0 AS spend,
-           s.conversions
+# ---------------------------------------------------------------
+# Queries: aggregate in the database, not in pandas.
+# Only one row per term/keyword/match type/campaign/ad group comes back,
+# instead of one row per day.
+# ---------------------------------------------------------------
+BASE_FROM = """
     FROM google_ads.search_term_keyword_stats s
     LEFT JOIN google_ads.campaign_history c
            ON c.id = s.campaign_id AND c._fivetran_active
     LEFT JOIN google_ads.ad_group_history g
            ON g.id = s.ad_group_id AND g._fivetran_active
 """
+
+AGG_QUERY = text(f"""
+    SELECT s.search_term,
+           COALESCE(s.info_text, '(no keyword)')                 AS keyword,
+           UPPER(COALESCE(s.search_term_match_type, 'UNKNOWN'))  AS match_type,
+           c.name                                                AS campaign,
+           g.name                                                AS ad_group,
+           SUM(s.impressions)                                    AS impressions,
+           SUM(s.clicks)                                         AS clicks,
+           SUM(s.cost_micros) / 1000000.0                        AS spend,
+           SUM(s.conversions)                                    AS conversions
+    {BASE_FROM}
+    WHERE s.date BETWEEN :start AND :end
+    GROUP BY 1, 2, 3, 4, 5
+""")
+
+DATE_BOUNDS_QUERY = text("""
+    SELECT MIN(date) AS min_d, MAX(date) AS max_d
+    FROM google_ads.search_term_keyword_stats
+""")
+
+KEYWORD_QUERY = text("""
+    SELECT DISTINCT info_text
+    FROM google_ads.search_term_keyword_stats
+    WHERE info_text IS NOT NULL
+""")
 
 LOOSE_MATCH = ("BROAD", "PHRASE", "NEAR_PHRASE")
 EXACT_MATCH = ("EXACT", "NEAR_EXACT")
@@ -57,18 +79,47 @@ COL_CONFIG = {
 }
 
 
-@st.cache_data(ttl=600)
-def load_data():
-    engine = create_engine(st.secrets["URL"])
-    df = pd.read_sql(QUERY, engine)
-    df["date"] = pd.to_datetime(df["date"]).dt.date
-    df["match_type"] = df["match_type"].fillna("UNKNOWN").str.upper()
-    df["keyword"] = df["keyword"].fillna("(no keyword)")
+# ---------------------------------------------------------------
+# Data access
+# ---------------------------------------------------------------
+@st.cache_resource
+def get_engine():
+    """One shared engine for the whole app (the old code made a new one on every reload)."""
+    return create_engine(
+        st.secrets["URL"],
+        pool_size=2,
+        max_overflow=2,
+        pool_pre_ping=True,   # drop dead connections (e.g. after the DB sleeps)
+        pool_recycle=300,
+    )
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_date_bounds():
+    with get_engine().connect() as conn:
+        row = conn.execute(DATE_BOUNDS_QUERY).one()
+    return pd.to_datetime(row.min_d).date(), pd.to_datetime(row.max_d).date()
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_bid_keywords():
+    with get_engine().connect() as conn:
+        kws = pd.read_sql(KEYWORD_QUERY, conn)["info_text"]
+    return frozenset(clean_keyword(k) for k in kws)
+
+
+# max_entries caps memory: only the last few date ranges stay cached.
+@st.cache_data(ttl=3600, max_entries=5, show_spinner="Loading search terms...")
+def load_terms(start, end):
+    with get_engine().connect() as conn:
+        df = pd.read_sql(AGG_QUERY, conn, params={"start": start, "end": end})
+    num = ["impressions", "clicks", "spend", "conversions"]
+    df[num] = df[num].fillna(0)
     return df
 
 
-def clean_keyword(text):
-    return re.sub(r'[\[\]"+]', "", str(text)).strip().lower()
+def clean_keyword(text_):
+    return re.sub(r'[\[\]"+]', "", str(text_)).strip().lower()
 
 
 def apply_rules(df, rules, logic):
@@ -141,8 +192,6 @@ def rule_builder(kind, defaults):
     return active
 
 
-raw = load_data()
-
 # ---------------------------------------------------------------
 # Sidebar: relevance + configurable rules
 # ---------------------------------------------------------------
@@ -176,10 +225,25 @@ add_logic = "AND" if add_logic.startswith("All") else "OR"
 # ---------------------------------------------------------------
 st.title("Search Term Review")
 
+try:
+    min_d, max_d = load_date_bounds()
+except Exception as e:  # keep the page up with a clear message instead of a crash
+    st.error(f"Couldn't reach the database. Try again in a minute.\n\n{e}")
+    st.stop()
+
 f1, f2, f3, f4 = st.columns([1.2, 2, 1.4, 2])
-min_d, max_d = raw["date"].min(), raw["date"].max()
 with f1:
     date_range = st.date_input("Date range", (min_d, max_d), min_value=min_d, max_value=max_d)
+
+# While she's mid-selection the picker returns one date; use the full range until both are set.
+start, end = date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (min_d, max_d)
+
+try:
+    raw = load_terms(start, end)
+except Exception as e:
+    st.error(f"Couldn't load search terms. Try again in a minute.\n\n{e}")
+    st.stop()
+
 with f2:
     campaigns = st.multiselect("Campaigns", sorted(raw["campaign"].dropna().unique()),
                                placeholder="All campaigns")
@@ -189,20 +253,14 @@ with f3:
 with f4:
     search = st.text_input("Search terms or keywords", placeholder="e.g. etl, pricing")
 
-data = raw
-if isinstance(date_range, tuple) and len(date_range) == 2:
-    data = data[(data["date"] >= date_range[0]) & (data["date"] <= date_range[1])]
+# Data is already aggregated, so these are cheap filters (no groupby needed).
+view = raw
 if campaigns:
-    data = data[data["campaign"].isin(campaigns)]
+    view = view[view["campaign"].isin(campaigns)]
 if match_types:
-    data = data[data["match_type"].isin(match_types)]
+    view = view[view["match_type"].isin(match_types)]
+view = view.copy()
 
-group_cols = ["search_term", "keyword", "match_type", "campaign", "ad_group"]
-view = (
-    data.groupby(group_cols, dropna=False)[["impressions", "clicks", "spend", "conversions"]]
-    .sum()
-    .reset_index()
-)
 view["cpc"] = (view["spend"] / view["clicks"]).where(view["clicks"] > 0)
 view["cpa"] = (view["spend"] / view["conversions"]).where(view["conversions"] > 0)
 
@@ -214,7 +272,7 @@ if search:
 # ---------------------------------------------------------------
 # Relevance (automatic)
 # ---------------------------------------------------------------
-bid_keywords = {clean_keyword(k) for k in raw["keyword"].unique()}
+bid_keywords = load_bid_keywords()
 term_lower = view["search_term"].str.lower()
 view["is_keyword"] = term_lower.isin(bid_keywords)
 
@@ -236,20 +294,22 @@ auto_relevant_terms = set(view.loc[view["reason"] != "", "search_term"])
 removed_terms = set(st.session_state.get("not_relevant", []))
 view["relevant"] = (view["reason"] != "") & ~view["search_term"].isin(removed_terms)
 
-
-def suggest(row):
-    if row["relevant"]:
-        return "Relevant - keep"
-    if row["conversions"] > 0:
-        return "Converting - keep"
-    if row["match_type"] in LOOSE_MATCH:
-        return "Tighten match type or add negative"
-    if row["match_type"] in EXACT_MATCH:
-        return "Review keyword itself"
-    return "Review"
-
-
-view["suggestion"] = view.apply(suggest, axis=1)
+# Vectorized (was a row-by-row .apply)
+view["suggestion"] = np.select(
+    [
+        view["relevant"],
+        view["conversions"] > 0,
+        view["match_type"].isin(LOOSE_MATCH),
+        view["match_type"].isin(EXACT_MATCH),
+    ],
+    [
+        "Relevant - keep",
+        "Converting - keep",
+        "Tighten match type or add negative",
+        "Review keyword itself",
+    ],
+    default="Review",
+)
 
 # ---------------------------------------------------------------
 # Relevant terms (top)
@@ -259,6 +319,7 @@ with st.expander(f"Relevant terms ({len(relevant)})", expanded=True):
     rel_cols = ["search_term", "reason", "keyword", "match_type", "clicks", "spend", "conversions", "cpa"]
     st.dataframe(relevant[rel_cols], hide_index=True, use_container_width=True,
                  column_config=COL_CONFIG, height=250)
+    st.subheader("Relevant terms", help="A term is relevant if it matches a keyword you bid on, or contains a word from the Relevant words list in the sidebar.")
     st.multiselect(
         "Remove from relevant",
         sorted(auto_relevant_terms | removed_terms),
@@ -273,12 +334,11 @@ with st.expander(f"Relevant terms ({len(relevant)})", expanded=True):
 # ---------------------------------------------------------------
 # Wasted spend = spend on search terms with ZERO conversions in the selected
 # dates, EXCLUDING terms marked relevant (e.g. anything containing "fivetran").
-hm = view.copy()
-hm["wasted"] = hm["spend"].where((hm["conversions"] == 0) & (~hm["relevant"]), 0)
+wasted = view["spend"].where((view["conversions"] == 0) & (~view["relevant"]), 0)
 
-total_spend = hm["spend"].sum()
-total_wasted = hm["wasted"].sum()
-wasted_terms = int((hm["wasted"] > 0).sum())
+total_spend = view["spend"].sum()
+total_wasted = wasted.sum()
+wasted_terms = int((wasted > 0).sum())
 
 st.subheader("Where the money is going")
 m1, m2, m3 = st.columns(3)
@@ -298,7 +358,9 @@ hm_view = st.radio(
          "Darker = more expensive.",
 )
 
-hm = (hm.groupby(["keyword", "match_type"])[["spend", "wasted", "conversions"]]
+hm = (view[["keyword", "match_type", "spend", "conversions"]]
+      .assign(wasted=wasted)
+      .groupby(["keyword", "match_type"])[["spend", "wasted", "conversions"]]
       .sum().reset_index())
 hm["cpa"] = (hm["spend"] / hm["conversions"]).where(hm["conversions"] > 0)
 hm["wasted_share"] = (hm["wasted"] / hm["spend"]).where(hm["spend"] > 0)
