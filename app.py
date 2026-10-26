@@ -9,9 +9,7 @@ from sqlalchemy import create_engine, text
 st.set_page_config(page_title="Search Term Review", layout="wide")
 
 # ---------------------------------------------------------------
-# Queries: aggregate in the database, not in pandas.
-# Only one row per term/keyword/match type/campaign/ad group comes back,
-# instead of one row per day.
+# Queries (aggregation happens in the database, not in pandas)
 # ---------------------------------------------------------------
 BASE_FROM = """
     FROM google_ads.search_term_keyword_stats s
@@ -21,12 +19,15 @@ BASE_FROM = """
            ON g.id = s.ad_group_id AND g._fivetran_active
 """
 
-AGG_QUERY = text(f"""
+# One row per term / keyword / match type / campaign / ad group.
+# status = the term's most recent status in Google Ads (ADDED, EXCLUDED, ...).
+TERMS_QUERY = text(f"""
     SELECT s.search_term,
            COALESCE(s.info_text, '(no keyword)')                 AS keyword,
            UPPER(COALESCE(s.search_term_match_type, 'UNKNOWN'))  AS match_type,
            c.name                                                AS campaign,
            g.name                                                AS ad_group,
+           (ARRAY_AGG(s.status ORDER BY s.date DESC))[1]         AS status,
            SUM(s.impressions)                                    AS impressions,
            SUM(s.clicks)                                         AS clicks,
            SUM(s.cost_micros) / 1000000.0                        AS spend,
@@ -34,6 +35,18 @@ AGG_QUERY = text(f"""
     {BASE_FROM}
     WHERE s.date BETWEEN :start AND :end
     GROUP BY 1, 2, 3, 4, 5
+""")
+
+# One row per day per campaign, for trends and the campaign heat map.
+DAILY_QUERY = text(f"""
+    SELECT s.date,
+           c.name                          AS campaign,
+           SUM(s.clicks)                   AS clicks,
+           SUM(s.cost_micros) / 1000000.0  AS spend,
+           SUM(s.conversions)              AS conversions
+    {BASE_FROM}
+    WHERE s.date BETWEEN :start AND :end
+    GROUP BY 1, 2
 """)
 
 DATE_BOUNDS_QUERY = text("""
@@ -50,6 +63,13 @@ KEYWORD_QUERY = text("""
 LOOSE_MATCH = ("BROAD", "PHRASE", "NEAR_PHRASE")
 EXACT_MATCH = ("EXACT", "NEAR_EXACT")
 
+STATUS_LABELS = {
+    "ADDED": "Added",
+    "EXCLUDED": "Excluded",
+    "ADDED_EXCLUDED": "Added & excluded",
+    "NONE": "Not added",
+}
+
 METRICS = {
     "Spend ($)": "spend",
     "Clicks": "clicks",
@@ -61,6 +81,8 @@ METRICS = {
 OPERATORS = [">=", "<=", ">", "<", "="]
 OP_LABELS = {">=": "at least", "<=": "at most", ">": "more than",
              "<": "less than", "=": "exactly"}
+STEPS = {"spend": 10.0, "clicks": 1.0, "impressions": 100.0,
+         "conversions": 1.0, "cpc": 0.5, "cpa": 10.0}
 
 COL_CONFIG = {
     "search_term": "Search term",
@@ -68,14 +90,18 @@ COL_CONFIG = {
     "match_type": "Match type",
     "campaign": "Campaign",
     "ad_group": "Ad group",
+    "brand_type": "Type",
+    "status_label": "In Google Ads",
     "impressions": st.column_config.NumberColumn("Impr.", format="%d"),
     "clicks": st.column_config.NumberColumn("Clicks", format="%d"),
     "spend": st.column_config.NumberColumn("Spend", format="$%.2f"),
     "cpc": st.column_config.NumberColumn("CPC", format="$%.2f"),
     "conversions": st.column_config.NumberColumn("Conv.", format="%.1f"),
     "cpa": st.column_config.NumberColumn("CPA", format="$%.2f"),
+    "wasted": st.column_config.NumberColumn("Wasted spend", format="$%.2f", help="Spend on search terms with zero conversions in the selected dates."),
+    "wasted_pct": st.column_config.NumberColumn("% wasted", format="%.0f%%", help="Wasted spend divided by total spend for this row."),
     "suggestion": "Suggestion",
-    "reason": "Why it's relevant",
+    "why": "Why",
 }
 
 
@@ -84,14 +110,18 @@ COL_CONFIG = {
 # ---------------------------------------------------------------
 @st.cache_resource
 def get_engine():
-    """One shared engine for the whole app (the old code made a new one on every reload)."""
-    return create_engine(
-        st.secrets["URL"],
-        pool_size=2,
-        max_overflow=2,
-        pool_pre_ping=True,   # drop dead connections (e.g. after the DB sleeps)
-        pool_recycle=300,
-    )
+    return create_engine(st.secrets["URL"], pool_size=2, max_overflow=2,
+                         pool_pre_ping=True, pool_recycle=300)
+
+
+def clean_keyword(text_):
+    return re.sub(r'[\[\]"+]', "", str(text_)).strip().lower()
+
+
+def brand_type(name):
+    """Campaign names ending in B = brand, G = non-brand."""
+    last = str(name).strip()[-1:].upper() if isinstance(name, str) else ""
+    return {"B": "Brand", "G": "Non-brand"}.get(last, "Other")
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -108,18 +138,75 @@ def load_bid_keywords():
     return frozenset(clean_keyword(k) for k in kws)
 
 
-# max_entries caps memory: only the last few date ranges stay cached.
 @st.cache_data(ttl=3600, max_entries=5, show_spinner="Loading search terms...")
 def load_terms(start, end):
     with get_engine().connect() as conn:
-        df = pd.read_sql(AGG_QUERY, conn, params={"start": start, "end": end})
+        df = pd.read_sql(TERMS_QUERY, conn, params={"start": start, "end": end})
     num = ["impressions", "clicks", "spend", "conversions"]
-    df[num] = df[num].fillna(0)
+    df[num] = df[num].astype(float).fillna(0)
+    df["status"] = df["status"].fillna("UNKNOWN").astype(str).str.upper()
+    df["status_label"] = df["status"].map(STATUS_LABELS).fillna("Unknown")
+    df["brand_type"] = df["campaign"].map(brand_type)
     return df
 
 
-def clean_keyword(text_):
-    return re.sub(r'[\[\]"+]', "", str(text_)).strip().lower()
+@st.cache_data(ttl=3600, max_entries=5, show_spinner=False)
+def load_daily(start, end):
+    with get_engine().connect() as conn:
+        df = pd.read_sql(DAILY_QUERY, conn, params={"start": start, "end": end})
+    num = ["clicks", "spend", "conversions"]
+    df[num] = df[num].astype(float).fillna(0)
+    df["date"] = pd.to_datetime(df["date"])
+    df["brand_type"] = df["campaign"].map(brand_type)
+    return df
+
+
+# ---------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------
+def add_rates(df):
+    df["cpc"] = (df["spend"] / df["clicks"]).where(df["clicks"] > 0)
+    df["cpa"] = (df["spend"] / df["conversions"]).where(df["conversions"] > 0)
+    return df
+
+
+def summarize(df, by):
+    """Roll term-level rows up to campaigns, ad groups, etc."""
+    out = (df.groupby(by, dropna=False)[["clicks", "spend", "conversions", "wasted"]]
+           .sum().reset_index())
+    out = add_rates(out)
+    out["wasted_pct"] = (out["wasted"] / out["spend"] * 100).where(out["spend"] > 0)
+    return out.sort_values("spend", ascending=False)
+
+
+def why_text(df):
+    """A plain-language reason for each row."""
+    out = []
+    for spend, clicks, conv, cpa in zip(df["spend"], df["clicks"], df["conversions"], df["cpa"]):
+        if conv > 0:
+            out.append(f"{conv:,.1f} conversions at ${cpa:,.0f} each (${spend:,.0f} spent)")
+        elif spend > 0:
+            out.append(f"${spend:,.0f} spent over {clicks:,.0f} clicks with no conversions")
+        else:
+            out.append("No spend in these dates")
+    return out
+
+
+def suggestion(df):
+    return np.select(
+        [df["conversions"] > 0,
+         df["match_type"].isin(LOOSE_MATCH),
+         df["match_type"].isin(EXACT_MATCH)],
+        ["Converting - keep",
+         "Tighten match type or add negative",
+         "Review keyword itself"],
+        default="Review",
+    )
+
+
+def download(df, cols, filename, label="Download CSV"):
+    st.download_button(label, df[cols].to_csv(index=False), filename, "text/csv",
+                       key=f"dl_{filename}")
 
 
 def apply_rules(df, rules, logic):
@@ -143,10 +230,6 @@ def apply_rules(df, rules, logic):
     for m in masks[1:]:
         out = (out & m) if logic == "AND" else (out | m)
     return out
-
-
-STEPS = {"spend": 10.0, "clicks": 1.0, "impressions": 100.0,
-         "conversions": 1.0, "cpc": 0.5, "cpa": 10.0}
 
 
 def rule_builder(kind, defaults):
@@ -192,253 +275,265 @@ def rule_builder(kind, defaults):
     return active
 
 
-# ---------------------------------------------------------------
-# Sidebar: relevance + configurable rules
-# ---------------------------------------------------------------
-st.sidebar.header("Relevance")
-words_text = st.sidebar.text_input(
-    "Relevant words (comma-separated)",
-    value="fivetran",
-    help="Any search term containing one of these is marked relevant. "
-         "Terms that match a keyword you already bid on are relevant automatically.",
-)
-relevant_words = [w.strip().lower() for w in words_text.split(",") if w.strip()]
+def heatmap(df, x, y, color, color_title, x_title, x_sort=None, key=None, selectable=False):
+    """Simple heat map. Returns the clicked cells when selectable."""
+    sel = alt.selection_point(name="cell", fields=[x, y]) if selectable else None
+    chart = alt.Chart(df).mark_rect(stroke="white", strokeWidth=2, cornerRadius=3).encode(
+        x=alt.X(f"{x}:N", title=x_title, sort=x_sort,
+                axis=alt.Axis(labelAngle=0, orient="top")),
+        y=alt.Y(f"{y}:N", title=None,
+                sort=alt.EncodingSortField(field=color, op="sum", order="descending")),
+        color=alt.Color(f"{color}:Q", title=color_title, scale=alt.Scale(scheme="reds"),
+                        legend=alt.Legend(format="$,.0f")),
+        tooltip=[
+            alt.Tooltip(f"{y}:N"), alt.Tooltip(f"{x}:N"),
+            alt.Tooltip("spend:Q", title="Spend", format="$,.2f"),
+            alt.Tooltip("conversions:Q", title="Conversions", format=",.1f"),
+            alt.Tooltip("cpa:Q", title="CPA", format="$,.2f"),
+        ],
+    ).properties(height=max(250, 30 * df[y].nunique()))
+    if selectable:
+        chart = chart.encode(opacity=alt.condition(sel, alt.value(1), alt.value(0.3))).add_params(sel)
+        event = st.altair_chart(chart, use_container_width=True, on_select="rerun", key=key)
+        return event.get("selection", {}).get("cell", []) if event else []
+    st.altair_chart(chart, use_container_width=True)
+    return []
 
-st.sidebar.divider()
-st.sidebar.header("Negatives rules")
-st.sidebar.caption("Feeds the Recommended negatives tab.")
-neg_rules = rule_builder("neg", [("Spend ($)", ">=", 100.0), ("Conversions", "<=", 0.0)])
-neg_logic = st.sidebar.radio("Match", ["All rules (AND)", "Any rule (OR)"],
-                             horizontal=True, key="neg_logic")
-neg_logic = "AND" if neg_logic.startswith("All") else "OR"
-
-st.sidebar.divider()
-st.sidebar.header("Adds rules")
-st.sidebar.caption("Feeds the Recommended adds tab.")
-add_rules = rule_builder("add", [("Conversions", ">=", 1.0), ("CPA ($)", "<=", 200.0)])
-add_logic = st.sidebar.radio("Match", ["All rules (AND)", "Any rule (OR)"],
-                             horizontal=True, key="add_logic")
-add_logic = "AND" if add_logic.startswith("All") else "OR"
 
 # ---------------------------------------------------------------
-# Top filter bar
+# Pages
 # ---------------------------------------------------------------
-st.title("Search Term Review")
+def overview_page():
+    st.title("Overview")
+    st.caption(f"{start:%b %d, %Y} to {end:%b %d, %Y}")
+
+    spend, conv = terms["spend"].sum(), terms["conversions"].sum()
+    wasted = terms["wasted"].sum()
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Spend", f"${spend:,.0f}")
+    m2.metric("Conversions", f"{conv:,.1f}")
+    m3.metric("Cost per conversion", f"${spend / conv:,.0f}" if conv else "–")
+    m4.metric("Wasted spend", f"${wasted:,.0f}",
+              f"{wasted / spend * 100:.0f}% of spend" if spend else None, delta_color="off")
+    st.caption("**Wasted spend** = spend on search terms with zero conversions in these dates.")
+
+    st.subheader("Spend over time")
+    trend = daily.groupby("date")[["spend", "conversions"]].sum().reset_index()
+    trend["spend"] = trend["spend"].round(2)
+    if trend.empty:
+        st.info("No data for the current filters.")
+    else:
+        st.line_chart(trend, x="date", y="spend", y_label="Spend ($)", x_label="")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.subheader("Top campaigns by spend")
+        camp = summarize(terms, ["campaign", "brand_type"]).head(10)
+        st.dataframe(camp[["campaign", "brand_type", "spend", "conversions", "cpa", "wasted_pct"]],
+                     hide_index=True, use_container_width=True, column_config=COL_CONFIG)
+    with c2:
+        st.subheader("Biggest wasted spend")
+        top_waste = terms[terms["wasted"] > 0].sort_values("wasted", ascending=False).head(10)
+        st.dataframe(top_waste[["search_term", "campaign", "clicks", "wasted"]],
+                     hide_index=True, use_container_width=True, column_config=COL_CONFIG)
+
+
+def search_terms_page():
+    st.title("Search terms")
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Negatives rules")
+    st.sidebar.caption("Feeds the Recommended negatives tab.")
+    neg_rules = rule_builder("neg", [("Spend ($)", ">=", 100.0), ("Conversions", "<=", 0.0)])
+    neg_logic = st.sidebar.radio("Match", ["All rules (AND)", "Any rule (OR)"],
+                                 horizontal=True, key="neg_logic")
+    neg_logic = "AND" if neg_logic.startswith("All") else "OR"
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Adds rules")
+    st.sidebar.caption("Feeds the Recommended adds tab.")
+    add_rules = rule_builder("add", [("Conversions", ">=", 1.0), ("CPA ($)", "<=", 200.0)])
+    add_logic = st.sidebar.radio("Match", ["All rules (AND)", "Any rule (OR)"],
+                                 horizontal=True, key="add_logic")
+    add_logic = "AND" if add_logic.startswith("All") else "OR"
+
+    view = terms.copy()
+    view["why"] = why_text(view)
+    view["suggestion"] = suggestion(view)
+
+    # Heat map: keyword x match type, click a cell to filter the tables
+    st.subheader("Where the money is going")
+    hm_view = st.radio("Color the heat map by", ["Wasted spend", "CPA"], horizontal=True,
+                       help="CPA = spend divided by conversions. Darker = more expensive.")
+    hm = summarize(view, ["keyword", "match_type"])
+    metric = "wasted" if hm_view == "Wasted spend" else "cpa"
+    hm = hm[hm[metric] > 0]
+    top_kw = hm.groupby("keyword")[metric].sum().sort_values(ascending=False).head(20).index
+    hm = hm[hm["keyword"].isin(top_kw)]
+
+    picked = []
+    if hm.empty:
+        st.info("Nothing to show for the current filters.")
+    else:
+        picked = heatmap(hm, "match_type", "keyword", metric, hm_view, "Match type",
+                         key="kw_heatmap", selectable=True)
+        st.caption("Each cell is one keyword at one match type. Click a cell to filter "
+                   "the tables below; click empty space to clear.")
+    if picked:
+        keys = {(p.get("keyword"), p.get("match_type")) for p in picked}
+        view = view[[(k, m) in keys for k, m in zip(view["keyword"], view["match_type"])]]
+        st.info("Filtered to: " + ", ".join(f"{k} ({m})" for k, m in keys))
+
+    # Never recommend negating your own keyword or something already excluded,
+    # and never recommend adding something already added.
+    negatives = view[apply_rules(view, neg_rules, neg_logic)
+                     & ~view["is_keyword"]
+                     & ~view["status"].isin(["EXCLUDED", "ADDED_EXCLUDED"])] \
+        .sort_values("spend", ascending=False)
+    adds = view[apply_rules(view, add_rules, add_logic)
+                & ~view["is_keyword"]
+                & ~view["match_type"].isin(EXACT_MATCH)
+                & ~view["status"].isin(["ADDED", "ADDED_EXCLUDED"])] \
+        .sort_values("conversions", ascending=False)
+
+    cols = ["search_term", "status_label", "why", "keyword", "match_type", "campaign",
+            "ad_group", "impressions", "clicks", "spend", "cpc", "conversions", "cpa",
+            "suggestion"]
+
+    tab_all, tab_neg, tab_add = st.tabs([
+        f"All search terms ({len(view)})",
+        f"Recommended negatives ({len(negatives)})",
+        f"Recommended adds ({len(adds)})",
+    ])
+    with tab_all:
+        st.dataframe(view.sort_values(["clicks", "spend"], ascending=False)[cols],
+                     hide_index=True, use_container_width=True, column_config=COL_CONFIG)
+        download(view, cols, "all_search_terms.csv")
+    with tab_neg:
+        st.dataframe(negatives[cols], hide_index=True, use_container_width=True,
+                     column_config=COL_CONFIG)
+        download(negatives, cols, "recommended_negatives.csv")
+    with tab_add:
+        st.dataframe(adds[cols], hide_index=True, use_container_width=True,
+                     column_config=COL_CONFIG)
+        download(adds, cols, "recommended_adds.csv")
+
+
+def campaigns_page():
+    st.title("Campaigns")
+
+    st.subheader("Spend by campaign and week")
+    hm_view = st.radio("Color by", ["Spend", "CPA"], horizontal=True, key="camp_hm")
+    wk = daily.assign(week=daily["date"].dt.to_period("W").dt.start_time)
+    wk = wk.groupby(["campaign", "week"])[["clicks", "spend", "conversions"]].sum().reset_index()
+    wk = add_rates(wk)
+    metric = "spend" if hm_view == "Spend" else "cpa"
+    wk = wk[wk[metric] > 0]
+    top = wk.groupby("campaign")["spend"].sum().sort_values(ascending=False).head(25).index
+    wk = wk[wk["campaign"].isin(top)].sort_values("week")
+    wk["week_label"] = wk["week"].dt.strftime("%b %d")
+    if wk.empty:
+        st.info("No data for the current filters.")
+    else:
+        heatmap(wk, "week_label", "campaign", metric, hm_view, "Week starting",
+                x_sort=list(wk["week_label"].unique()))
+        st.caption("Each cell is one campaign in one week. Hover for details. "
+                   "Showing the top 25 campaigns by spend.")
+
+    st.subheader("All campaigns")
+    camp = summarize(terms, ["campaign", "brand_type"])
+    cols = ["campaign", "brand_type", "clicks", "spend", "conversions", "cpa", "wasted", "wasted_pct"]
+    st.dataframe(camp[cols], hide_index=True, use_container_width=True, column_config=COL_CONFIG)
+    download(camp, cols, "campaigns.csv")
+
+    st.subheader("Drill into a campaign")
+    choice = st.selectbox("Campaign", camp["campaign"].dropna().tolist(), index=None,
+                          placeholder="Pick a campaign to see its ad groups...")
+    if choice:
+        ag = summarize(terms[terms["campaign"] == choice], ["ad_group"])
+        ag_cols = ["ad_group", "clicks", "spend", "conversions", "cpa", "wasted", "wasted_pct"]
+        st.dataframe(ag[ag_cols], hide_index=True, use_container_width=True,
+                     column_config=COL_CONFIG)
+
+
+def ad_groups_page():
+    st.title("Ad groups")
+
+    ag = summarize(terms, ["campaign", "ad_group"])
+    cols = ["campaign", "ad_group", "clicks", "spend", "conversions", "cpa", "wasted", "wasted_pct"]
+    st.dataframe(ag[cols], hide_index=True, use_container_width=True, column_config=COL_CONFIG)
+    download(ag, cols, "ad_groups.csv")
+
+    st.subheader("Drill into an ad group")
+    pairs = {f"{c} › {a}": (c, a)
+             for c, a in ag[["campaign", "ad_group"]].dropna().itertuples(index=False, name=None)}
+    label = st.selectbox("Ad group", list(pairs), index=None,
+                         placeholder="Pick an ad group to see its search terms...")
+    if label:
+        camp_name, ag_name = pairs[label]
+        sub = terms[(terms["campaign"] == camp_name) & (terms["ad_group"] == ag_name)].copy()
+        sub["why"] = why_text(sub)
+        sub_cols = ["search_term", "status_label", "why", "keyword", "match_type",
+                    "clicks", "spend", "conversions", "cpa"]
+        st.dataframe(sub.sort_values("spend", ascending=False)[sub_cols], hide_index=True,
+                     use_container_width=True, column_config=COL_CONFIG)
+        download(sub, sub_cols, "ad_group_search_terms.csv")
+
+
+# ---------------------------------------------------------------
+# Navigation + shared filter sidebar (applies to every page)
+# ---------------------------------------------------------------
+pg = st.navigation([
+    st.Page(overview_page, title="Overview", default=True),
+    st.Page(search_terms_page, title="Search terms"),
+    st.Page(campaigns_page, title="Campaigns"),
+    st.Page(ad_groups_page, title="Ad groups"),
+])
+
+st.sidebar.header("Filter")
 
 try:
     min_d, max_d = load_date_bounds()
-except Exception as e:  # keep the page up with a clear message instead of a crash
+except Exception as e:
     st.error(f"Couldn't reach the database. Try again in a minute.\n\n{e}")
     st.stop()
 
-f1, f2, f3, f4 = st.columns([1.2, 2, 1.4, 2])
-with f1:
-    date_range = st.date_input("Date range", (min_d, max_d), min_value=min_d, max_value=max_d)
-
-# While she's mid-selection the picker returns one date; use the full range until both are set.
+date_range = st.sidebar.date_input("Date range", (min_d, max_d),
+                                   min_value=min_d, max_value=max_d)
 start, end = date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (min_d, max_d)
 
 try:
     raw = load_terms(start, end)
+    daily_raw = load_daily(start, end)
+    bid_keywords = load_bid_keywords()
 except Exception as e:
-    st.error(f"Couldn't load search terms. Try again in a minute.\n\n{e}")
+    st.error(f"Couldn't load data. Try again in a minute.\n\n{e}")
     st.stop()
 
-with f2:
-    campaigns = st.multiselect("Campaigns", sorted(raw["campaign"].dropna().unique()),
-                               placeholder="All campaigns")
-with f3:
-    match_types = st.multiselect("Match types", sorted(raw["match_type"].unique()),
-                                 placeholder="All match types")
-with f4:
-    search = st.text_input("Search terms or keywords", placeholder="e.g. etl, pricing")
+brand = st.sidebar.radio("Campaign type", ["All", "Brand", "Non-brand"], horizontal=True,
+                         help="Brand = campaign name ends in B. Non-brand = ends in G.")
+camp_types = raw[["campaign", "brand_type"]].drop_duplicates()
+if brand != "All":
+    camp_types = camp_types[camp_types["brand_type"] == brand]
+campaign_options = sorted(camp_types["campaign"].dropna().unique())
+campaigns = st.sidebar.multiselect("Campaigns", campaign_options, placeholder="All campaigns")
+match_types = st.sidebar.multiselect("Match types", sorted(raw["match_type"].unique()),
+                                     placeholder="All match types")
+search = st.sidebar.text_input("Search terms or keywords", placeholder="e.g. etl, pricing")
 
-# Data is already aggregated, so these are cheap filters (no groupby needed).
-view = raw
-if campaigns:
-    view = view[view["campaign"].isin(campaigns)]
+terms, daily = raw, daily_raw
+if brand != "All" or campaigns:
+    allowed = set(campaigns) if campaigns else set(campaign_options)
+    terms = terms[terms["campaign"].isin(allowed)]
+    daily = daily[daily["campaign"].isin(allowed)]
 if match_types:
-    view = view[view["match_type"].isin(match_types)]
-view = view.copy()
-
-view["cpc"] = (view["spend"] / view["clicks"]).where(view["clicks"] > 0)
-view["cpa"] = (view["spend"] / view["conversions"]).where(view["conversions"] > 0)
-
+    terms = terms[terms["match_type"].isin(match_types)]
 if search:
-    hit = (view["search_term"].str.contains(search, case=False, regex=False, na=False)
-           | view["keyword"].str.contains(search, case=False, regex=False, na=False))
-    view = view[hit]
+    terms = terms[terms["search_term"].str.contains(search, case=False, regex=False, na=False)
+                  | terms["keyword"].str.contains(search, case=False, regex=False, na=False)]
 
-# ---------------------------------------------------------------
-# Relevance (automatic)
-# ---------------------------------------------------------------
-bid_keywords = load_bid_keywords()
-term_lower = view["search_term"].str.lower()
-view["is_keyword"] = term_lower.isin(bid_keywords)
+terms = add_rates(terms.copy())
+terms["is_keyword"] = terms["search_term"].str.lower().isin(bid_keywords)
+terms["wasted"] = terms["spend"].where(terms["conversions"] == 0, 0)
 
-
-def relevance_reason(term, is_kw):
-    reasons = []
-    if is_kw:
-        reasons.append("Matches a keyword you bid on")
-    hits = [w for w in relevant_words if w in term]
-    if hits:
-        reasons.append("Contains: " + ", ".join(hits))
-    return "; ".join(reasons)
-
-
-view["reason"] = [relevance_reason(t, k) for t, k in zip(term_lower, view["is_keyword"])]
-auto_relevant_terms = set(view.loc[view["reason"] != "", "search_term"])
-
-# Terms she has removed from the relevant list (overrides the automatic rules)
-removed_terms = set(st.session_state.get("not_relevant", []))
-view["relevant"] = (view["reason"] != "") & ~view["search_term"].isin(removed_terms)
-
-# Vectorized (was a row-by-row .apply)
-view["suggestion"] = np.select(
-    [
-        view["relevant"],
-        view["conversions"] > 0,
-        view["match_type"].isin(LOOSE_MATCH),
-        view["match_type"].isin(EXACT_MATCH),
-    ],
-    [
-        "Relevant - keep",
-        "Converting - keep",
-        "Tighten match type or add negative",
-        "Review keyword itself",
-    ],
-    default="Review",
-)
-
-# ---------------------------------------------------------------
-# Relevant terms (top)
-# ---------------------------------------------------------------
-relevant = view[view["relevant"]].sort_values("spend", ascending=False)
-with st.expander(f"Relevant terms ({len(relevant)})", expanded=True):
-    rel_cols = ["search_term", "reason", "keyword", "match_type", "clicks", "spend", "conversions", "cpa"]
-    st.dataframe(relevant[rel_cols], hide_index=True, use_container_width=True,
-                 column_config=COL_CONFIG, height=250)
-    st.subheader("Relevant terms", help="A term is relevant if it matches a keyword you bid on, or contains a word from the Relevant words list in the sidebar.")
-    st.multiselect(
-        "Remove from relevant",
-        sorted(auto_relevant_terms | removed_terms),
-        key="not_relevant",
-        placeholder="Type to search for a term that shouldn't be here...",
-        help="Removed terms are treated like any other term: they can show up as "
-             "wasted spend and in Recommended negatives. Click ✕ on a term to put it back.",
-    )
-
-# ---------------------------------------------------------------
-# Wasted spend summary + heat map (click a cell to filter the tables below)
-# ---------------------------------------------------------------
-# Wasted spend = spend on search terms with ZERO conversions in the selected
-# dates, EXCLUDING terms marked relevant (e.g. anything containing "fivetran").
-wasted = view["spend"].where((view["conversions"] == 0) & (~view["relevant"]), 0)
-
-total_spend = view["spend"].sum()
-total_wasted = wasted.sum()
-wasted_terms = int((wasted > 0).sum())
-
-st.subheader("Where the money is going")
-m1, m2, m3 = st.columns(3)
-m1.metric("Wasted spend", f"${total_wasted:,.0f}")
-m2.metric("Share of total spend", f"{(total_wasted / total_spend * 100) if total_spend else 0:.0f}%")
-m3.metric("Non-converting terms", f"{wasted_terms:,}")
-st.caption(
-    "**Wasted spend** = spend on search terms with zero conversions in the selected dates. "
-    "Terms marked relevant are never counted as wasted."
-)
-
-hm_view = st.radio(
-    "Color the heat map by",
-    ["Wasted spend", "CPA"],
-    horizontal=True,
-    help="CPA = spend divided by conversions, the cost to get one conversion. "
-         "Darker = more expensive.",
-)
-
-hm = (view[["keyword", "match_type", "spend", "conversions"]]
-      .assign(wasted=wasted)
-      .groupby(["keyword", "match_type"])[["spend", "wasted", "conversions"]]
-      .sum().reset_index())
-hm["cpa"] = (hm["spend"] / hm["conversions"]).where(hm["conversions"] > 0)
-hm["wasted_share"] = (hm["wasted"] / hm["spend"]).where(hm["spend"] > 0)
-metric = "wasted" if hm_view == "Wasted spend" else "cpa"
-hm = hm.dropna(subset=[metric])
-hm = hm[hm[metric] > 0]
-top_keywords = (hm.groupby("keyword")[metric].sum()
-                .sort_values(ascending=False).head(20).index)
-hm = hm[hm["keyword"].isin(top_keywords)]
-
-picked = []
-if hm.empty:
-    st.info("Nothing to show for the current filters.")
-else:
-    cell = alt.selection_point(name="cell", fields=["keyword", "match_type"])
-    base = alt.Chart(hm).encode(
-        x=alt.X("match_type:N", title="Match type", axis=alt.Axis(labelAngle=0, orient="top")),
-        y=alt.Y("keyword:N", title=None,
-                sort=alt.EncodingSortField(field=metric, op="sum", order="descending")),
-    )
-    rects = base.mark_rect(stroke="white", strokeWidth=2, cornerRadius=3).encode(
-        color=alt.Color(f"{metric}:Q", title=hm_view, scale=alt.Scale(scheme="reds"),
-                        legend=alt.Legend(format="$,.0f")),
-        opacity=alt.condition(cell, alt.value(1), alt.value(0.3)),
-        tooltip=[
-            alt.Tooltip("keyword:N", title="Keyword"),
-            alt.Tooltip("match_type:N", title="Match type"),
-            alt.Tooltip("spend:Q", title="Total spend", format="$,.2f"),
-            alt.Tooltip("wasted:Q", title="Wasted spend", format="$,.2f"),
-            alt.Tooltip("wasted_share:Q", title="Share wasted", format=".0%"),
-            alt.Tooltip("conversions:Q", title="Conversions", format=",.1f"),
-            alt.Tooltip("cpa:Q", title="CPA", format="$,.2f"),
-        ],
-    ).add_params(cell)
-    # Streamlit can't do click-selection on layered charts, so no text layer here;
-    # dollar values are in the tooltip and the legend.
-    chart = rects.properties(height=max(250, 32 * hm["keyword"].nunique()))
-    event = st.altair_chart(chart, use_container_width=True, on_select="rerun", key="heatmap")
-    picked = event.get("selection", {}).get("cell", []) if event else []
-    st.caption("Each cell is one keyword at one match type. Hover for details. "
-               "Click a cell to filter the tables below; click empty space to clear.")
-
-if picked:
-    keys = {(p.get("keyword"), p.get("match_type")) for p in picked}
-    view = view[[(k, m) in keys for k, m in zip(view["keyword"], view["match_type"])]]
-    st.info("Filtered to: " + ", ".join(f"{k} ({m})" for k, m in keys))
-
-# ---------------------------------------------------------------
-# Tables
-# ---------------------------------------------------------------
-negatives = view[apply_rules(view, neg_rules, neg_logic) & ~view["relevant"]] \
-    .sort_values("spend", ascending=False)
-adds = view[apply_rules(view, add_rules, add_logic)
-            & ~view["is_keyword"]
-            & ~view["match_type"].isin(EXACT_MATCH)] \
-    .sort_values("conversions", ascending=False)
-
-tab_all, tab_neg, tab_add = st.tabs([
-    f"All search terms ({len(view)})",
-    f"Recommended negatives ({len(negatives)})",
-    f"Recommended adds ({len(adds)})",
-])
-
-table_cols = ["search_term", "keyword", "match_type", "campaign", "ad_group",
-              "impressions", "clicks", "spend", "cpc", "conversions", "cpa", "suggestion"]
-
-with tab_all:
-    st.dataframe(view.sort_values(["clicks", "spend"], ascending=False)[table_cols],
-                 hide_index=True, use_container_width=True, column_config=COL_CONFIG)
-
-with tab_neg:
-    st.dataframe(negatives[table_cols], hide_index=True, use_container_width=True,
-                 column_config=COL_CONFIG)
-    st.download_button("Download negatives CSV", negatives[table_cols].to_csv(index=False),
-                       "recommended_negatives.csv", "text/csv")
-
-with tab_add:
-    st.dataframe(adds[table_cols], hide_index=True, use_container_width=True,
-                 column_config=COL_CONFIG)
-    st.download_button("Download adds CSV", adds[table_cols].to_csv(index=False),
-                       "recommended_adds.csv", "text/csv")
+pg.run()
