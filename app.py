@@ -1,4 +1,6 @@
+import datetime as dt
 import re
+from collections import Counter
 
 import altair as alt
 import numpy as np
@@ -37,16 +39,36 @@ TERMS_QUERY = text(f"""
     GROUP BY 1, 2, 3, 4, 5
 """)
 
-# One row per day per campaign, for trends and the campaign heat map.
+# One row per day per campaign per match type, for the trend chart and campaign heat map.
 DAILY_QUERY = text(f"""
     SELECT s.date,
-           c.name                          AS campaign,
-           SUM(s.clicks)                   AS clicks,
-           SUM(s.cost_micros) / 1000000.0  AS spend,
-           SUM(s.conversions)              AS conversions
+           c.name                                                AS campaign,
+           UPPER(COALESCE(s.search_term_match_type, 'UNKNOWN'))  AS match_type,
+           SUM(s.impressions)                                    AS impressions,
+           SUM(s.clicks)                                         AS clicks,
+           SUM(s.cost_micros) / 1000000.0                        AS spend,
+           SUM(s.conversions)                                    AS conversions
     {BASE_FROM}
     WHERE s.date BETWEEN :start AND :end
-    GROUP BY 1, 2
+    GROUP BY 1, 2, 3
+""")
+
+# Two back-to-back 30-day periods ending on the last day of the date range,
+# for the month-over-month trends. period = 'current' or 'prior'.
+TREND_QUERY = text(f"""
+    SELECT CASE WHEN s.date > :mid THEN 'current' ELSE 'prior' END  AS period,
+           s.search_term,
+           COALESCE(s.info_text, '(no keyword)')                 AS keyword,
+           UPPER(COALESCE(s.search_term_match_type, 'UNKNOWN'))  AS match_type,
+           c.name                                                AS campaign,
+           (ARRAY_AGG(s.status ORDER BY s.date DESC))[1]         AS status,
+           SUM(s.impressions)                                    AS impressions,
+           SUM(s.clicks)                                         AS clicks,
+           SUM(s.cost_micros) / 1000000.0                        AS spend,
+           SUM(s.conversions)                                    AS conversions
+    {BASE_FROM}
+    WHERE s.date BETWEEN :start AND :end
+    GROUP BY 1, 2, 3, 4, 5
 """)
 
 # Every search term ever added or negated (all time, not limited by the date range).
@@ -74,6 +96,26 @@ KEYWORD_QUERY = text("""
     FROM google_ads.search_term_keyword_stats
     WHERE info_text IS NOT NULL
 """)
+
+# Conversion tracking changed on Aug 27, 2026; numbers before Aug 28 are inflated.
+CONVERSION_CHANGE = dt.date(2026, 8, 28)
+
+TREND_DAYS = 30
+
+# Heat map / chart options: label -> (column, legend format)
+VIEW_OPTIONS = {
+    "Spend": ("spend", "$,.0f"),
+    "CPA": ("cpa", "$,.0f"),
+    "Clicks": ("clicks", ",.0f"),
+    "Impressions": ("impressions", ",.0f"),
+}
+
+# Words ignored when finding themes in search terms.
+STOPWORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does", "for", "from",
+    "how", "i", "in", "is", "it", "my", "near", "me", "of", "on", "or", "the", "to",
+    "vs", "what", "when", "where", "which", "who", "why", "with", "you", "your",
+}
 
 LOOSE_MATCH = ("BROAD", "PHRASE", "NEAR_PHRASE")
 EXACT_MATCH = ("EXACT", "NEAR_EXACT")
@@ -181,11 +223,25 @@ def load_terms(start, end):
 def load_daily(start, end):
     with get_engine().connect() as conn:
         df = pd.read_sql(DAILY_QUERY, conn, params={"start": start, "end": end})
-    num = ["clicks", "spend", "conversions"]
+    num = ["impressions", "clicks", "spend", "conversions"]
     df[num] = df[num].astype(float).fillna(0)
     df["date"] = pd.to_datetime(df["date"])
     df["brand_type"] = df["campaign"].map(brand_type)
     return df
+
+
+@st.cache_data(ttl=3600, max_entries=5, show_spinner="Loading trends...")
+def load_trends(end):
+    """The 30 days ending on end (current) and the 30 days before that (prior)."""
+    mid = end - dt.timedelta(days=TREND_DAYS)
+    start = end - dt.timedelta(days=2 * TREND_DAYS - 1)
+    with get_engine().connect() as conn:
+        df = pd.read_sql(TREND_QUERY, conn, params={"start": start, "mid": mid, "end": end})
+    num = ["impressions", "clicks", "spend", "conversions"]
+    df[num] = df[num].astype(float).fillna(0)
+    df = label_status(df)
+    df["brand_type"] = df["campaign"].map(brand_type)
+    return df, start, mid
 
 
 @st.cache_data(ttl=3600, show_spinner="Loading added and negated terms...")
@@ -209,7 +265,7 @@ def add_rates(df):
 
 def summarize(df, by):
     """Roll term-level rows up to campaigns, ad groups, etc."""
-    out = (df.groupby(by, dropna=False)[["clicks", "spend", "conversions"]]
+    out = (df.groupby(by, dropna=False)[["impressions", "clicks", "spend", "conversions"]]
            .sum().reset_index())
     out = add_rates(out)
     return out.sort_values("spend", ascending=False)
@@ -341,18 +397,21 @@ def rule_builder(kind, defaults):
     st.session_state[f"{kind}_logic_saved"] = "AND" if choice.startswith("All") else "OR"
 
 
-def heatmap(df, x, y, color, color_title, x_title, x_sort=None, key=None, selectable=False):
-    """Simple heat map. Returns the clicked cells when selectable."""
+def heatmap(df, x, y, view, x_title, x_sort=None, key=None, selectable=False):
+    """Simple heat map colored by a VIEW_OPTIONS label. Returns clicked cells when selectable."""
+    color, fmt = VIEW_OPTIONS[view]
     sel = alt.selection_point(name="cell", fields=[x, y]) if selectable else None
     chart = alt.Chart(df).mark_rect(stroke="white", strokeWidth=2, cornerRadius=3).encode(
         x=alt.X(f"{x}:N", title=x_title, sort=x_sort,
                 axis=alt.Axis(labelAngle=0, orient="top")),
         y=alt.Y(f"{y}:N", title=None,
                 sort=alt.EncodingSortField(field=color, op="sum", order="descending")),
-        color=alt.Color(f"{color}:Q", title=color_title, scale=alt.Scale(scheme="blues"),
-                        legend=alt.Legend(format="$,.0f")),
+        color=alt.Color(f"{color}:Q", title=view, scale=alt.Scale(scheme="blues"),
+                        legend=alt.Legend(format=fmt)),
         tooltip=[
             alt.Tooltip(f"{y}:N"), alt.Tooltip(f"{x}:N"),
+            alt.Tooltip("impressions:Q", title="Impressions", format=",.0f"),
+            alt.Tooltip("clicks:Q", title="Clicks", format=",.0f"),
             alt.Tooltip("spend:Q", title="Spend", format="$,.2f"),
             alt.Tooltip("conversions:Q", title="Conversions", format=",.1f"),
             alt.Tooltip("cpa:Q", title="CPA", format="$,.2f"),
@@ -366,6 +425,35 @@ def heatmap(df, x, y, color, color_title, x_title, x_sort=None, key=None, select
     return []
 
 
+def pct_change(cur, prior):
+    return ((cur - prior) / prior * 100).where(prior > 0)
+
+
+def themes(search_terms, weights):
+    """Count one- and two-word phrases across search terms, weighted (e.g. by clicks)."""
+    counts = Counter()
+    for term, w in zip(search_terms, weights):
+        words = [x for x in re.findall(r"[a-z0-9]+", str(term).lower()) if x not in STOPWORDS]
+        phrases = set(words) | {f"{a} {b}" for a, b in zip(words, words[1:])}
+        for p in phrases:
+            counts[p] += w
+    return counts
+
+
+def trend_filters(df):
+    """Apply the sidebar filters (except date) to trend data."""
+    if allowed_campaigns is not None:
+        df = df[df["campaign"].isin(allowed_campaigns)]
+    if match_types:
+        df = df[df["match_type"].isin(match_types)]
+    if search:
+        df = df[df["search_term"].str.contains(search, case=False, regex=False, na=False)
+                | df["keyword"].str.contains(search, case=False, regex=False, na=False)]
+    df = add_rates(df.copy())
+    df["is_keyword"] = df["search_term"].str.lower().isin(bid_keywords)
+    return df
+
+
 # ---------------------------------------------------------------
 # Pages
 # ---------------------------------------------------------------
@@ -373,34 +461,68 @@ def overview_page():
     st.title("Overview")
     st.caption(f"{start:%b %d, %Y} to {end:%b %d, %Y}")
 
+    if start < CONVERSION_CHANGE:
+        st.warning(f"Conversion tracking changed on Aug 27, 2026. Conversions before "
+                   f"{CONVERSION_CHANGE:%b %d} are inflated, so set the start date to "
+                   f"{CONVERSION_CHANGE:%b %d} or later for accurate CPA.")
+
     negatives = recommended_negatives(terms)
     spend, conv = terms["spend"].sum(), terms["conversions"].sum()
+    clicks = terms["clicks"].sum()
     wasted = negatives["spend"].sum()
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Spend", f"${spend:,.0f}")
     m2.metric("Conversions", f"{conv:,.1f}")
     m3.metric("Cost per conversion", f"${spend / conv:,.0f}" if conv else "–")
-    m4.metric("Wasted spend", f"${wasted:,.0f}",
+    m4.metric("Avg. CPC", f"${spend / clicks:,.2f}" if clicks else "–",
+              help="Spend divided by clicks. Use the Campaign type filter to compare "
+                   "brand and non-brand.")
+    m5.metric("Wasted spend", f"${wasted:,.0f}",
               f"{len(negatives):,} terms to negate", delta_color="off", help=WASTED_HELP)
 
-    st.subheader("Spend over time")
-    trend = daily.groupby("date")[["spend", "conversions"]].sum().reset_index()
-    trend["spend"] = trend["spend"].round(2)
+    st.subheader("Weekly volume")
+    c_metric, c_split = st.columns(2)
+    vol = c_metric.radio("Show", ["Clicks", "Impressions"], horizontal=True, key="ov_vol")
+    split = c_split.radio("Split by", ["Total", "Match type"], horizontal=True, key="ov_split")
+    col = vol.lower()
+    vday = daily[daily["match_type"].isin(match_types)] if match_types else daily
+    vday = vday.assign(week=vday["date"].dt.to_period("W").dt.start_time)
+    by = ["week"] if split == "Total" else ["week", "match_type"]
+    trend = vday.groupby(by)[[col]].sum().reset_index().sort_values("week")
     if trend.empty:
         st.info("No data for the current filters.")
     else:
-        st.line_chart(trend, x="date", y="spend", y_label="Spend ($)", x_label="")
+        trend["week_label"] = trend["week"].dt.strftime("%b %d")
+        weeks = list(trend["week_label"].unique())
+        enc_color = (alt.value("#1f77b4") if split == "Total"
+                     else alt.Color("match_type:N", title="Match type"))
+        tips = [alt.Tooltip("week_label:N", title="Week starting"),
+                alt.Tooltip(f"{col}:Q", title=vol, format=",.0f")]
+        if split == "Match type":
+            tips.append(alt.Tooltip("match_type:N", title="Match type"))
+        chart = alt.Chart(trend).mark_bar().encode(
+            x=alt.X("week_label:N", title="Week starting", sort=weeks,
+                    axis=alt.Axis(labelAngle=0)),
+            y=alt.Y(f"{col}:Q", title=vol, stack=True),
+            color=enc_color,
+            tooltip=tips,
+        ).properties(height=300)
+        st.altair_chart(chart, use_container_width=True)
+        st.caption("Weeks start on Monday. The first and last weeks may be partial, "
+                   "depending on your date range.")
 
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Top campaigns by spend")
         camp = summarize(terms, ["campaign", "brand_type"]).head(10)
-        st.dataframe(camp[["campaign", "brand_type", "spend", "conversions", "cpa"]],
+        st.dataframe(camp[["campaign", "brand_type", "impressions", "clicks", "spend",
+                           "conversions", "cpa"]],
                      hide_index=True, use_container_width=True, column_config=COL_CONFIG)
     with c2:
         st.subheader("Top terms to negate", help=WASTED_HELP)
         top_neg = negatives.sort_values("spend", ascending=False).head(10)
-        st.dataframe(top_neg[["search_term", "campaign", "clicks", "spend"]],
+        st.dataframe(top_neg[["search_term", "campaign", "impressions", "clicks", "spend",
+                              "conversions"]],
                      hide_index=True, use_container_width=True, column_config=COL_CONFIG)
 
 
@@ -423,22 +545,26 @@ def search_terms_page():
 
     # Heat map: keyword x match type, click a cell to filter the tables
     st.subheader("Where's the money going?")
-    hm_view = st.radio("Color the heat map by", ["Spend", "CPA"], horizontal=True,
-                       help="CPA = spend divided by conversions. Darker = higher.")
+    hm_view = st.radio("Color the heat map by", list(VIEW_OPTIONS), horizontal=True,
+                       help="CPA = spend divided by conversions. Darker = higher. "
+                            "Impressions shows terms that are very visible but may not "
+                            "be getting clicks.")
     hm = summarize(view, ["keyword", "match_type"])
-    metric = "spend" if hm_view == "Spend" else "cpa"
+    metric = VIEW_OPTIONS[hm_view][0]
+    rank_by = metric if metric in ("clicks", "impressions") else "spend"
     hm = hm[hm[metric] > 0]
-    top_kw = hm.groupby("keyword")["spend"].sum().sort_values(ascending=False).head(20).index
+    top_kw = hm.groupby("keyword")[rank_by].sum().sort_values(ascending=False).head(20).index
     hm = hm[hm["keyword"].isin(top_kw)]
 
     picked = []
     if hm.empty:
         st.info("Nothing to show for the current filters.")
     else:
-        picked = heatmap(hm, "match_type", "keyword", metric, hm_view, "Match type",
+        picked = heatmap(hm, "match_type", "keyword", hm_view, "Match type",
                          key="kw_heatmap", selectable=True)
-        st.caption("Each cell is one keyword at one match type. Top 20 keywords by spend. "
-                   "Click a cell to filter the tables below; click empty space to clear.")
+        st.caption(f"Each cell is one keyword at one match type. Top 20 keywords by "
+                   f"{rank_by}. Click a cell to filter the tables below; click empty "
+                   f"space to clear.")
     if picked:
         keys = {(p.get("keyword"), p.get("match_type")) for p in picked}
         view = view[[(k, m) in keys for k, m in zip(view["keyword"], view["match_type"])]]
@@ -451,11 +577,14 @@ def search_terms_page():
             "ad_group", "impressions", "clicks", "spend", "cpc", "conversions", "cpa",
             "suggestion"]
 
-    tab_neg, tab_add, tab_all = st.tabs([
+    tab_neg, tab_add, tab_all, tab_trend = st.tabs([
         f"Recommended negatives ({len(negatives)})",
         f"Recommended adds ({len(adds)})",
         f"All search terms ({len(view)})",
+        "Trends (30-day)",
     ])
+    with tab_trend:
+        trends_section()
     with tab_neg:
         st.metric("Wasted spend", f"${negatives['spend'].sum():,.2f}", help=WASTED_HELP)
         st.dataframe(negatives[cols], hide_index=True, use_container_width=True,
@@ -471,30 +600,145 @@ def search_terms_page():
         download(view, cols, "all_search_terms.csv")
 
 
+def trends_section():
+    """Month-over-month view: keyword volume and themes in recommended negatives."""
+    try:
+        tr, t_start, mid = load_trends(end)
+    except Exception as e:
+        st.error(f"Couldn't load trends.\n\n{e}")
+        return
+    tr = trend_filters(tr)
+    cur_label = f"{mid + dt.timedelta(days=1):%b %d} – {end:%b %d}"
+    prior_label = f"{t_start:%b %d} – {mid:%b %d}"
+    st.caption(f"Last 30 days ({cur_label}) vs. the 30 days before ({prior_label}). "
+               f"Ends on the last day of your date range; the other filters apply.")
+    if t_start < CONVERSION_CHANGE:
+        st.warning("The earlier period includes days before the Aug 27 conversion tracking "
+                   "change, so conversion-based negatives rules may differ between periods.")
+
+    vol = st.radio("Measure by", ["Clicks", "Impressions"], horizontal=True, key="tr_vol")
+    col = vol.lower()
+
+    # --- Keywords going up or down ---
+    st.subheader("Keywords going up or down")
+    kw = (tr[tr["keyword"] != "(no keyword)"]
+          .pivot_table(index="keyword", columns="period", values=["clicks", "impressions"],
+                       aggfunc="sum", fill_value=0))
+    if kw.empty:
+        st.info("No keyword data for these periods.")
+    else:
+        kw.columns = [f"{m}_{p}" for m, p in kw.columns]
+        for m in ("clicks", "impressions"):
+            for p in ("current", "prior"):
+                kw[f"{m}_{p}"] = kw.get(f"{m}_{p}", 0)
+            kw[f"{m}_change"] = kw[f"{m}_current"] - kw[f"{m}_prior"]
+            kw[f"{m}_pct"] = pct_change(kw[f"{m}_current"], kw[f"{m}_prior"])
+        kw = kw.reset_index()
+        movers = kw.reindex(kw[f"{col}_change"].abs().sort_values(ascending=False).index).head(15)
+        movers = movers[movers[f"{col}_change"] != 0]
+        if not movers.empty:
+            movers["direction"] = np.where(movers[f"{col}_change"] > 0, "Up", "Down")
+            chart = alt.Chart(movers).mark_bar().encode(
+                x=alt.X(f"{col}_change:Q", title=f"Change in {vol.lower()}"),
+                y=alt.Y("keyword:N", title=None, sort="-x"),
+                color=alt.Color("direction:N", title=None,
+                                scale=alt.Scale(domain=["Up", "Down"],
+                                                range=["#2e7d32", "#c62828"])),
+                tooltip=[alt.Tooltip("keyword:N", title="Keyword"),
+                         alt.Tooltip(f"{col}_prior:Q", title="Prior 30 days", format=",.0f"),
+                         alt.Tooltip(f"{col}_current:Q", title="Last 30 days", format=",.0f"),
+                         alt.Tooltip(f"{col}_pct:Q", title="% change", format="+,.0f")],
+            ).properties(height=max(250, 26 * len(movers)))
+            st.altair_chart(chart, use_container_width=True)
+            st.caption(f"The 15 keywords with the biggest change in {vol.lower()}.")
+        kw_cols = ["keyword", "clicks_prior", "clicks_current", "clicks_pct",
+                   "impressions_prior", "impressions_current", "impressions_pct"]
+        st.dataframe(kw.sort_values(f"{col}_change", ascending=False)[kw_cols],
+                     hide_index=True, use_container_width=True, column_config={
+                         "keyword": "Keyword",
+                         "clicks_prior": st.column_config.NumberColumn("Clicks (prior)", format="%d"),
+                         "clicks_current": st.column_config.NumberColumn("Clicks (last 30)", format="%d"),
+                         "clicks_pct": st.column_config.NumberColumn("Clicks % chg", format="%+.0f%%"),
+                         "impressions_prior": st.column_config.NumberColumn("Impr. (prior)", format="%d"),
+                         "impressions_current": st.column_config.NumberColumn("Impr. (last 30)", format="%d"),
+                         "impressions_pct": st.column_config.NumberColumn("Impr. % chg", format="%+.0f%%"),
+                     })
+        download(kw, kw_cols, "keyword_trends.csv")
+
+    # --- Themes in recommended negatives ---
+    st.subheader("Top themes in recommended negatives",
+                 help="Words and two-word phrases that show up across the recommended "
+                      "negatives in each period, weighted by the measure above. Uses the "
+                      "negatives rules from the sidebar.")
+    rows = []
+    for period in ("prior", "current"):
+        neg = recommended_negatives(tr[tr["period"] == period])
+        for phrase, val in themes(neg["search_term"], neg[col]).items():
+            rows.append({"theme": phrase, "period": period, "value": val})
+    th = pd.DataFrame(rows)
+    if th.empty:
+        st.info("No recommended negatives in these periods.")
+        return
+    th = th.pivot_table(index="theme", columns="period", values="value",
+                        aggfunc="sum", fill_value=0)
+    for p in ("current", "prior"):
+        th[p] = th.get(p, 0)
+    th["change"] = th["current"] - th["prior"]
+    th["pct"] = pct_change(th["current"], th["prior"])
+    th = th.reset_index().sort_values("current", ascending=False)
+    top = th.head(15)
+    long = top.melt(id_vars="theme", value_vars=["prior", "current"],
+                     var_name="period", value_name="value")
+    long["period"] = long["period"].map({"prior": "Prior 30 days", "current": "Last 30 days"})
+    chart = alt.Chart(long).mark_bar().encode(
+        y=alt.Y("theme:N", title=None, sort=list(top["theme"])),
+        x=alt.X("value:Q", title=vol),
+        yOffset=alt.YOffset("period:N", sort=["Prior 30 days", "Last 30 days"]),
+        color=alt.Color("period:N", title=None, sort=["Prior 30 days", "Last 30 days"],
+                        scale=alt.Scale(range=["#b0bec5", "#1f77b4"])),
+        tooltip=[alt.Tooltip("theme:N", title="Theme"), alt.Tooltip("period:N", title="Period"),
+                 alt.Tooltip("value:Q", title=vol, format=",.0f")],
+    ).properties(height=max(300, 40 * len(top)))
+    st.altair_chart(chart, use_container_width=True)
+    st.caption("The 15 biggest themes in the last 30 days, next to the 30 days before.")
+    th_cols = ["theme", "prior", "current", "pct"]
+    st.dataframe(th[th_cols], hide_index=True, use_container_width=True, column_config={
+        "theme": "Theme",
+        "prior": st.column_config.NumberColumn(f"{vol} (prior)", format="%d"),
+        "current": st.column_config.NumberColumn(f"{vol} (last 30)", format="%d"),
+        "pct": st.column_config.NumberColumn("% chg", format="%+.0f%%"),
+    })
+    download(th, th_cols, "negative_themes.csv")
+
+
 def campaigns_page():
     st.title("Campaigns")
 
     st.subheader("Where's the money going?")
-    hm_view = st.radio("Color by", ["Spend", "CPA"], horizontal=True, key="camp_hm")
-    wk = daily.assign(week=daily["date"].dt.to_period("W").dt.start_time)
-    wk = wk.groupby(["campaign", "week"])[["clicks", "spend", "conversions"]].sum().reset_index()
+    hm_view = st.radio("Color by", list(VIEW_OPTIONS), horizontal=True, key="camp_hm")
+    wk = daily[daily["match_type"].isin(match_types)] if match_types else daily
+    wk = wk.assign(week=wk["date"].dt.to_period("W").dt.start_time)
+    wk = (wk.groupby(["campaign", "week"])[["impressions", "clicks", "spend", "conversions"]]
+          .sum().reset_index())
     wk = add_rates(wk)
-    metric = "spend" if hm_view == "Spend" else "cpa"
+    metric = VIEW_OPTIONS[hm_view][0]
+    rank_by = metric if metric in ("clicks", "impressions") else "spend"
     wk = wk[wk[metric] > 0]
-    top = wk.groupby("campaign")["spend"].sum().sort_values(ascending=False).head(25).index
+    top = wk.groupby("campaign")[rank_by].sum().sort_values(ascending=False).head(25).index
     wk = wk[wk["campaign"].isin(top)].sort_values("week")
     wk["week_label"] = wk["week"].dt.strftime("%b %d")
     if wk.empty:
         st.info("No data for the current filters.")
     else:
-        heatmap(wk, "week_label", "campaign", metric, hm_view, "Week starting",
+        heatmap(wk, "week_label", "campaign", hm_view, "Week starting",
                 x_sort=list(wk["week_label"].unique()))
-        st.caption("Each cell is one campaign in one week. Hover for details. "
-                   "Showing the top 25 campaigns by spend.")
+        st.caption(f"Each cell is one campaign in one week. Hover for details. "
+                   f"Showing the top 25 campaigns by {rank_by}.")
 
     st.subheader("All campaigns")
     camp = summarize(terms, ["campaign", "brand_type"])
-    cols = ["campaign", "brand_type", "clicks", "spend", "conversions", "cpa"]
+    cols = ["campaign", "brand_type", "impressions", "clicks", "spend", "cpc",
+            "conversions", "cpa"]
     st.dataframe(camp[cols], hide_index=True, use_container_width=True, column_config=COL_CONFIG)
     download(camp, cols, "campaigns.csv")
 
@@ -503,34 +747,9 @@ def campaigns_page():
                           placeholder="Pick a campaign to see its ad groups...")
     if choice:
         ag = summarize(terms[terms["campaign"] == choice], ["ad_group"])
-        ag_cols = ["ad_group", "clicks", "spend", "conversions", "cpa"]
+        ag_cols = ["ad_group", "impressions", "clicks", "spend", "cpc", "conversions", "cpa"]
         st.dataframe(ag[ag_cols], hide_index=True, use_container_width=True,
                      column_config=COL_CONFIG)
-
-
-def ad_groups_page():
-    st.title("Ad groups")
-
-    st.subheader("Where's the money going?")
-    ag = summarize(terms, ["campaign", "ad_group"])
-    cols = ["campaign", "ad_group", "clicks", "spend", "conversions", "cpa"]
-    st.dataframe(ag[cols], hide_index=True, use_container_width=True, column_config=COL_CONFIG)
-    download(ag, cols, "ad_groups.csv")
-
-    st.subheader("Drill into an ad group")
-    pairs = {f"{c} › {a}": (c, a)
-             for c, a in ag[["campaign", "ad_group"]].dropna().itertuples(index=False, name=None)}
-    label = st.selectbox("Ad group", list(pairs), index=None,
-                         placeholder="Pick an ad group to see its search terms...")
-    if label:
-        camp_name, ag_name = pairs[label]
-        sub = terms[(terms["campaign"] == camp_name) & (terms["ad_group"] == ag_name)].copy()
-        sub["why"] = why_text(sub)
-        sub_cols = ["search_term", "status_label", "why", "keyword", "match_type",
-                    "clicks", "spend", "conversions", "cpa"]
-        st.dataframe(sub.sort_values("spend", ascending=False)[sub_cols], hide_index=True,
-                     use_container_width=True, column_config=COL_CONFIG)
-        download(sub, sub_cols, "ad_group_search_terms.csv")
 
 
 def added_negated_page():
@@ -571,9 +790,8 @@ def added_negated_page():
 # ---------------------------------------------------------------
 pg = st.navigation([
     st.Page(overview_page, title="Overview", default=True),
-    st.Page(search_terms_page, title="Search terms"),
     st.Page(campaigns_page, title="Campaigns"),
-    st.Page(ad_groups_page, title="Ad groups"),
+    st.Page(search_terms_page, title="Search terms"),
     st.Page(added_negated_page, title="Added & negated"),
 ])
 
@@ -585,8 +803,11 @@ except Exception as e:
     st.error(f"Couldn't reach the database. Try again in a minute.\n\n{e}")
     st.stop()
 
-date_range = st.sidebar.date_input("Date range", (min_d, max_d),
-                                   min_value=min_d, max_value=max_d)
+default_start = min(max(min_d, CONVERSION_CHANGE), max_d)
+date_range = st.sidebar.date_input("Date range", (default_start, max_d),
+                                   min_value=min_d, max_value=max_d,
+                                   help="Starts on Aug 28 by default because conversion "
+                                        "tracking changed on Aug 27.")
 start, end = date_range if isinstance(date_range, tuple) and len(date_range) == 2 else (min_d, max_d)
 
 try:
